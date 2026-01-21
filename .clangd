@@ -1,0 +1,40 @@
+CompileFlags:
+  # Use pixi's C++ compiler for syntax checking
+  Compiler: .pixi/envs/default/bin/c++
+  # Add pixi's CUDA include paths
+  Add:
+    # CUDA toolkit headers from pixi environment
+    - "-I.pixi/envs/default/targets/x86_64-linux/include"
+    # Standard pixi include paths
+    - "-I.pixi/envs/default/include"
+    # C++ standard
+    - "-std=c++17"
+    # Define CUDA macros for syntax checking
+    - "-D__CUDACC__"
+    - "-D__NVCC__"
+  # Remove problematic flags that might conflict
+  Remove:
+    - "-W*"
+
+Diagnostics:
+  UnusedIncludes: Strict
+  ClangTidy:
+    Add:
+      - modernize*
+      - bugprone*
+    Remove:
+      - bugprone-easily-swappable-parameters
+    CheckOptions:
+      readability-identifier-naming.ClassCase: CamelCase
+      readability-identifier-naming.StructCase: CamelCase
+      readability-identifier-naming.FunctionCase: camelBack
+      readability-identifier-naming.VariableCase: camelBack
+      readability-identifier-naming.ParameterCase: camelBack
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
+
+Completion:
+  AllScopes: Yes

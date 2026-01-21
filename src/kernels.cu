@@ -1,7 +1,93 @@
+#include <cassert>
 #include <vector>
+#include <__clang_cuda_builtin_vars.h>
 #include <cuda_fp16.h>
 
 #include "../tester/utils.h"
+
+namespace detail {
+
+template <typename T>
+__device__ 
+T warp_trace_reduce(T sum, int warp_size) {
+  #pragma unroll
+  for (int offset = warp_size / 2; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+  }
+  return sum;
+}
+template <typename T>
+__global__
+void trace_kernel(
+  const T * __restrict__ ptr, 
+  T * __restrict__ gather, 
+  int rows, 
+  int cols, 
+  int warp_size
+) {
+  extern __shared__ char _smem[];
+  T* smem = reinterpret_cast<T*>(_smem);
+  auto idx = blockDim.x * blockIdx.x + threadIdx.x;
+  auto stride = blockDim.x * gridDim.x;
+  auto n = min(rows, cols);
+
+  auto tid = threadIdx.x;
+
+  T sum{};
+  for (auto i = idx; i < n; i += stride) {
+    sum += ptr[i * cols + i];
+  }
+  const T warp_sum = warp_trace_reduce(sum, warp_size);
+
+  if (tid % warp_size == 0) {
+    smem[tid / warp_size] = warp_sum;
+  }
+  __syncthreads();
+
+  const auto num_warps = (blockDim.x + warp_size - 1) / warp_size;
+  if (tid < warp_size) {
+    T block_sum = (tid < num_warps) ? smem[tid] : T{};
+    block_sum = warp_trace_reduce(block_sum, warp_size);
+    if (tid == 0) {
+      atomicAdd(gather, block_sum);
+    }
+  }
+}
+
+template <typename T>
+__global__
+void flash_atten_kernel(
+  const T * __restrict__ q,
+  const T * __restrict__ k,
+  const T * __restrict__ v,
+  T * __restrict__ o,
+  int batch_size, 
+  int target_seq_len, 
+  int src_seq_len, 
+  int query_heads, 
+  int kv_heads, 
+  int head_dim, 
+  bool is_causal
+) {
+  extern __shared__ char _smem[];
+  T *const smem = reinterpret_cast<T*>(_smem);
+  const auto tidx = threadIdx.x;
+  const auto tidy = threadIdx.y;
+
+  auto index_tgt = [&] (int b, int s, int h, int d) {
+    return ((b * target_seq_len + s) * query_heads + h) * head_dim + d; 
+  };
+  
+  auto index_src = [&] (int b, int s, int h, int d) {
+    return ((b * src_seq_len + s) * kv_heads + h) * head_dim + d; 
+  };
+
+  for (int i = 0; i < ) {
+
+  }
+
+}
+}
 
 /**
  * @brief Computes the trace of a matrix.
@@ -20,7 +106,36 @@
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // TODO: Implement the trace function
-  return T(-1);
+  
+  T *inp;
+  T *sum;
+  T result{};
+  cudaMalloc(&inp, sizeof(T) * rows * cols);
+  cudaMalloc(&sum, sizeof(T));
+
+  cudaMemcpy(inp, h_input.data(), sizeof(T) * rows * cols, cudaMemcpyHostToDevice);
+  cudaMemcpy(sum, &result, sizeof(T), cudaMemcpyHostToDevice);
+
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, 0);
+  int warpSize = prop.warpSize;
+
+  dim3 block {256};
+  dim3 grid {static_cast<unsigned int>((std::min(rows, cols) + block.x - 1) / 256)};
+  size_t smem_size = ((block.x + warpSize - 1) / warpSize) * sizeof(T);
+  detail::trace_kernel<T><<<grid, block, smem_size>>>(
+    inp, 
+    sum, 
+    rows, 
+    cols, 
+    warpSize
+  );
+
+  cudaMemcpy(&result, sum, sizeof(T), cudaMemcpyDeviceToHost);
+  cudaFree(inp);
+  cudaFree(sum);
+
+  return result;
 }
 
 /**
@@ -45,6 +160,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {       
   // TODO: Implement the flash attention function
+  assert(query_heads % kv_heads == 0);
 }
 
 // *********************************************************************

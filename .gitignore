@@ -1,0 +1,6 @@
+/.pixi
+/build/
+*.o
+/pixi.lock 
+test_*
+*.nsys-rep

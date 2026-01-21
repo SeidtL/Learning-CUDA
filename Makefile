@@ -14,7 +14,7 @@
 PLATFORM        ?= nvidia
 PLATFORM_DEFINE ?= -DPLATFORM_NVIDIA
 STUDENT_SUFFIX  := cu
-CFLAGS          := -std=c++17 -O0
+CFLAGS          := -std=c++17 -O0 -g -G
 EXTRA_LIBS     	:= 
 
 # Compiler & Tester object selection based on PLATFORM
