@@ -1,0 +1,17 @@
+[
+  {
+    "arguments": [
+      "/usr/local/cuda/bin/nvcc",
+      "-std=c++17",
+      "-O0",
+      "-DPLATFORM_NVIDIA",
+      "-c",
+      "-o",
+      "src/kernels.o",
+      "src/kernels.cu"
+    ],
+    "directory": "/home/monsoon/Learning-CUDA",
+    "file": "/home/monsoon/Learning-CUDA/src/kernels.cu",
+    "output": "/home/monsoon/Learning-CUDA/src/kernels.o"
+  }
+]
