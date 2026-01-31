@@ -10,10 +10,16 @@
 #include "../tester/utils.h"
 
 #define S_ASSERT(expr) assert(expr)
-// #define S_ASSERT(expr) 
+// #define S_ASSERT(expr)
 
 template <uint32_t warp_size>
-constexpr auto full_mask_v = warp_size == 32 ? 0xFFFFFFFFFFFFFFFFULL : 0xFFFFFFFFULL;
+constexpr auto full_mask_v = 0; 
+
+template <>
+constexpr uint32_t full_mask_v<32u> = 0xFFFFFFFFU;
+
+template <>
+constexpr uint64_t full_mask_v<64u> = 0xFFFFFFFFFFFFFFFFULL;
 
 int get_warp_size() {
   cudaDeviceProp prop;
@@ -34,8 +40,8 @@ static T warp_trace_reduce(T sum) {
 template <typename T, uint32_t warp_size>
 __global__
 void trace_kernel(
-  const T * __restrict__ ptr, 
-  T * __restrict__ gather, 
+  const T * __restrict__ ptr,
+  T * __restrict__ gather,
   int n
 ) {
   extern __shared__ char _smem[];
@@ -70,7 +76,7 @@ template <typename T>
 using remove_cvref_t = std::remove_cv_t<std::remove_reference_t<T>>;
 
 template <typename To, typename From>
-__host__ __device__ __forceinline__ 
+__host__ __device__ __forceinline__
 static To cast(From x) {
   using type = remove_cvref_t<From>;
   if constexpr (std::is_same_v<type, half>) {
@@ -88,8 +94,8 @@ private:
   int col_stride_;
 
 public:
-  __device__ 
-  mdspan2d(T* data, int row_stride, int col_stride) 
+  __device__
+  mdspan2d(T* data, int row_stride, int col_stride)
       : data_(data), row_stride_(row_stride), col_stride_(col_stride) {}
 
   __device__ __forceinline__
@@ -104,7 +110,7 @@ public:
 };
 
 template <typename T>
-__device__ 
+__device__
 T* arena_alloc(uintptr_t &addr, size_t n) {
     size_t alignment = alignof(T);
     addr = (addr + alignment - 1) & ~(alignment - 1);
@@ -138,31 +144,31 @@ void attention_kernel(
   const T * __restrict__ v_base_ptr,
   T * __restrict__ o_base_ptr,
   float softmax_scale,
-  int batch_size, 
-  int target_seq_len, 
-  int src_seq_len, 
-  int query_heads, 
-  int kv_heads, 
-  int head_dim, 
+  int batch_size,
+  int target_seq_len,
+  int src_seq_len,
+  int query_heads,
+  int kv_heads,
+  int head_dim,
   bool is_causal,
   int group_size,
   uint32_t Br,
   uint32_t Tc
 ) {
   extern __shared__ char _smem[];
-  
+
   #define k_valid_fn(qid, kid) ((kid) < src_seq_len && !(is_causal && (kid) > (qid)))
 
   constexpr uint32_t Bc = warp_size;
   uintptr_t smem = reinterpret_cast<uintptr_t>(_smem);
-  mdspan2d<T> Qs(arena_alloc<T>(smem, Br * head_dim), head_dim, 1);
-  mdspan2d<T> Ks(arena_alloc<T>(smem, Bc * head_dim), head_dim, 1);
+  mdspan2d<float> Qs(arena_alloc<float>(smem, Br * head_dim), head_dim, 1);
+  mdspan2d<float> Ks(arena_alloc<float>(smem, Bc * head_dim), head_dim, 1);
   // mdspan2d<T> Vs(arena_alloc<T>(smem, Bc * head_dim), 1, Bc);
-  mdspan2d<T> Vs(arena_alloc<T>(smem, Bc * head_dim), head_dim, 1);
-  mdspan2d<U> Ss(arena_alloc<U>(smem, Br * Bc), Bc, 1); 
+  mdspan2d<float> Vs(arena_alloc<float>(smem, Bc * head_dim), head_dim, 1);
+  mdspan2d<double> Ss(arena_alloc<double>(smem, Br * Bc), Bc, 1);
 
   constexpr uint32_t Os_size = (max_head_dim + warp_size - 1) / warp_size;
-  U Os[(max_head_dim + warp_size - 1) / warp_size];
+  float Os[(max_head_dim + warp_size - 1) / warp_size];
 
   const auto bid = blockIdx.x;
   const auto hid = blockIdx.y;
@@ -171,27 +177,27 @@ void attention_kernel(
   // q
   const auto tid = threadIdx.x / warp_size;
   // k
-  const auto wid = threadIdx.x % warp_size; 
+  const auto wid = threadIdx.x % warp_size;
 
   const mdspan2d<const T> Q(
-    q_base_ptr + bid * target_seq_len * query_heads * head_dim + hid * head_dim, 
+    q_base_ptr + bid * target_seq_len * query_heads * head_dim + hid * head_dim,
     query_heads * head_dim, 1
   );
   const mdspan2d<const T> K(
-    k_base_ptr + bid * src_seq_len * kv_heads * head_dim + hid / group_size * head_dim, 
+    k_base_ptr + bid * src_seq_len * kv_heads * head_dim + hid / group_size * head_dim,
     kv_heads * head_dim, 1
   );
   const mdspan2d<const T> V(
-    v_base_ptr + bid * src_seq_len * kv_heads * head_dim + hid / group_size * head_dim, 
+    v_base_ptr + bid * src_seq_len * kv_heads * head_dim + hid / group_size * head_dim,
     kv_heads * head_dim, 1
   );
   mdspan2d<T> O(
-    o_base_ptr + bid * target_seq_len * query_heads * head_dim + hid * head_dim, 
+    o_base_ptr + bid * target_seq_len * query_heads * head_dim + hid * head_dim,
     query_heads * head_dim, 1
   );
 
   for (uint32_t inner_qid = 0; inner_qid < Tr; ++inner_qid) {
-    const uint32_t i = outer_qid * Tr + inner_qid;      
+    const uint32_t i = outer_qid * Tr + inner_qid;
     const uint32_t qid = i * Br + tid;
     const bool q_valid = qid < target_seq_len;
     // Load Q
@@ -207,8 +213,10 @@ void attention_kernel(
       Os[i] = 0.0;
     }
 
-    U l_old = 0.0;
-    U m_old = -INFINITY;
+    // float -> double doesn't work in Iluvatar
+    float l_old = 0.0;
+    // half, float doesn't work in Iluvatar
+    double m_old = -INFINITY;
 
     for (int j = 0; j < Tc; ++j) {
       // Load KV
@@ -224,53 +232,53 @@ void attention_kernel(
       __syncthreads();
 
       // Q @ K^T
-      U m_new = -INFINITY;
+      double m_new = -INFINITY;
       const auto kid = j * Bc + wid;
 
-      const bool k_block_valid = not is_causal || j * Bc <= qid; 
+      const bool k_block_valid = not is_causal || j * Bc <= qid;
       if (q_valid && k_block_valid) {
         const bool k_valid = k_valid_fn(qid, kid);
         if (k_valid) {
           float t = 0.0f;
           for (uint32_t y = 0; y < head_dim; y++) {
-            t += cast<U>(Qs(tid, y)) * cast<U>(Ks(wid, y));
+            t += Qs(tid, y) * Ks(wid, y);
           }
           S_ASSERT(not isinf(t));
-          Ss(tid, wid) = cast<U>(t) * softmax_scale;
+          Ss(tid, wid) = cast<double>(t) * softmax_scale;
           m_new = max(m_new, Ss(tid, wid));
         } else {
           Ss(tid, wid) = -INFINITY;
         }
         __syncwarp();
-  
+
         // max reduce
         #pragma unroll
         for (uint32_t offset = warp_size >> 1; offset > 0; offset >>= 1) {
           m_new = max(m_new, __shfl_xor_sync(full_mask_v<warp_size>, m_new, offset));
         }
         m_new = max(m_old, m_new);
-  
+
         // update l, m
-        U l_new = 0.0;
+        double l_new = 0.0;
         Ss(tid, wid) = exp_dispatch<U>(Ss(tid, wid) - m_new);
         l_new += Ss(tid, wid);
         __syncwarp();
-  
+
         // sum reduce
         #pragma unroll
         for (uint32_t offset = warp_size >> 1; offset > 0; offset >>= 1) {
           l_new += __shfl_xor_sync(full_mask_v<warp_size>, l_new, offset);
         }
-        U exp_old = isinf(m_old) ? 0.0 : exp_dispatch<U>(m_old - m_new);
+        U exp_old = isinf(m_old) ? 0.0 : exp_dispatch<double>(m_old - m_new);
         l_new = exp_old * l_old + l_new;
-  
+
         // P @ V
         for (uint32_t x = wid; x < head_dim; x += warp_size) {
-          U t = 0.0f;
+          double t = 0.0f;
 
           for (uint32_t _y = 0, y = wid; _y < Bc; _y++, y = (y + 1) % Bc) {
             if (k_valid_fn(qid, j * Bc + y)) {
-              t += Ss(tid, y) * cast<U>(Vs(y, x));
+              t += Ss(tid, y) * cast<double>(Vs(y, x));
             }
           }
 
@@ -290,7 +298,7 @@ void attention_kernel(
   }
 }
 
-template <typename T, typename U, uint32_t Tr, typename ...Args> 
+template <typename T, typename U, uint32_t Tr, typename ...Args>
 void attention_dispatch(uint32_t warp_size, size_t head_dim, dim3 grid, dim3 block, size_t smem_size, Args&&... args) {
   if (warp_size == 32) {
     constexpr uint32_t _warp_size = 32;
@@ -336,7 +344,7 @@ void attention_dispatch(uint32_t warp_size, size_t head_dim, dim3 grid, dim3 blo
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // TODO: Implement the trace function
-    
+
   const size_t n = std::min(rows, cols);
 
   if (n == 0) {
@@ -402,9 +410,7 @@ template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len,
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
-
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
   using U = std::conditional_t<std::is_same_v<remove_cvref_t<T>, float>, double, float>;
   constexpr size_t type_size = sizeof(T);
 
@@ -426,7 +432,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   const auto warpSize = get_warp_size();
 
   uint32_t Bc = warpSize;
-  constexpr uint32_t Br = 16; 
+  constexpr uint32_t Br = 16;
   constexpr uint32_t Tr = 1;
   uint32_t Tc = (src_seq_len + Bc - 1) / Bc;
   uint32_t q_tile_count = (target_seq_len + Br - 1) / Br;
@@ -435,12 +441,12 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   uint32_t group_size = query_heads / kv_heads;
 
   size_t smem_bytes = (Bc * head_dim * 2 + Br * head_dim) * sizeof(float)
-    + (Br * Bc) * sizeof(U) + alignof(U);
+    + (Br * Bc) * sizeof(double) + alignof(double);
 
   dim3 block{Bc * Br};
   dim3 grid{
-    static_cast<uint32_t>(batch_size), 
-    static_cast<uint32_t>(query_heads), 
+    static_cast<uint32_t>(batch_size),
+    static_cast<uint32_t>(query_heads),
     q_grid
   };
 
@@ -449,8 +455,8 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   attention_dispatch<T, U, Tr>(
     warpSize,
     head_dim,
-    grid, 
-    block, 
+    grid,
+    block,
     smem_bytes,
     d_q,
     d_k,
@@ -462,7 +468,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     src_seq_len,
     query_heads,
     kv_heads,
-    head_dim, 
+    head_dim,
     is_causal,
     group_size,
     Br,
