@@ -1,0 +1,8 @@
+/build/
+*.o
+*.nsys-rep
+tester/diff.h
+.clangd
+*.sh
+*.py
+/test_kernels
