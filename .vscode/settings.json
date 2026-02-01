@@ -1,0 +1,13 @@
+{
+    "clangd.fallbackFlags": [
+        "-std=c++17",
+        "-Wall"
+    ],
+    "clangd.arguments": [
+        "--fallback-style=Google",
+        "--header-insertion-decorators",
+        "--compile-commands-dir=${workspaceRoot}",
+        "--background-index=true",
+        "-j=3"
+    ],
+}
