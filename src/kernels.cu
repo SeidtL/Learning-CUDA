@@ -329,28 +329,28 @@ void attention_dispatch(uint32_t warp_size, size_t head_dim, dim3 grid, dim3 blo
 
 
 template <typename T>
-void trace_copy(const T *h, size_t n, size_t stride, T *buffer, T *dst, cudaStream_t stream) {
+void trace_copy(const T *h, size_t n, size_t stride, T *buffer, T *dst) {
   for (size_t i = 0; i < n; ++i) {
     buffer[i] = h[i * stride];
   }
-  cudaMemcpyAsync(dst, buffer, sizeof(T) * n, cudaMemcpyHostToDevice, stream);
+  cudaMemcpy(dst, buffer, sizeof(T) * n, cudaMemcpyHostToDevice);
 }
 
 template <typename T>
-void trace_execute(const T *data, T *s_d, T *s_h, uint32_t n, uint32_t warp_size, cudaStream_t stream) {
+void trace_execute(const T *data, T *s_d, T *s_h, uint32_t n, uint32_t warp_size) {
   constexpr static dim3 block {256};
   constexpr static dim3 grid {1};
   size_t smem_size = ((block.x + warp_size - 1) / warp_size) * sizeof(T);
 
-  cudaMemsetAsync(s_d, 0, sizeof(T), stream);
+  cudaMemset(s_d, 0, sizeof(T));
   if (warp_size == 32) {
-    trace_kernel<T, 32><<<grid, block, smem_size, stream>>>(data, s_d, n);
+    trace_kernel<T, 32><<<grid, block, smem_size>>>(data, s_d, n);
   } else if (warp_size == 64) {
-    trace_kernel<T, 64><<<grid, block, smem_size, stream>>>(data, s_d, n);
+    trace_kernel<T, 64><<<grid, block, smem_size>>>(data, s_d, n);
   } else {
     S_ASSERT(false);
   }
-  cudaMemcpyAsync(s_h, s_d, sizeof(T), cudaMemcpyDeviceToHost, stream);
+  cudaMemcpy(s_h, s_d, sizeof(T), cudaMemcpyDeviceToHost);
 }
 
 /**
@@ -376,77 +376,22 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   if (n == 0) {
     return T{0};
   }
-  cudaStream_t stream1;
-  RUNTIME_CHECK(cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking));
-
-  T *sum;
-  T result {0};
 
   constexpr uint32_t block_size = 1024;
   const uint32_t block_count = (n + block_size - 1) / block_size; 
   const uint32_t warp_size = get_warp_size();
 
-  rows = std::min(n, rows);
-  if (n <= block_size) {
-    T *id;
-    T *sd;
-    T sh;
-    RUNTIME_CHECK(cudaMallocAsync(&id, sizeof(T) * n, stream1));
-    RUNTIME_CHECK(cudaMallocAsync(&sd, sizeof(T), stream1));
-    std::vector<T> buf(n);
-    trace_copy(h_input.data(), n, cols + 1, buf.data(), id, stream1);
-    trace_execute(id, sd, &sh, n, warp_size, stream1);
-    cudaStreamSynchronize(stream1);
-    RUNTIME_CHECK(cudaFreeAsync(id, stream1));
-    RUNTIME_CHECK(cudaFreeAsync(sd, stream1));
-    RUNTIME_CHECK(cudaStreamDestroy(stream1));
-    return sh;
-  }
-
-  cudaStream_t stream2;
-  RUNTIME_CHECK(cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking));
-  
-  size_t offset = 0;
-  size_t rest = n;
-  // container
-  T _sh1, _sh2;
-  std::vector<T> _buf1(block_size), _buf2(block_size);
-
-  struct DoubleBuffer { cudaStream_t stream; T *sh; T *buf; T *id; T *sd; };
-  DoubleBuffer buf1 = {stream1, &_sh1, _buf1.data()};
-  DoubleBuffer buf2 = {stream2, &_sh2, _buf2.data()};
-
-  RUNTIME_CHECK(cudaMallocAsync(&buf1.id, sizeof(T) * n, buf1.stream));
-  RUNTIME_CHECK(cudaMallocAsync(&buf1.sd, sizeof(T), buf1.stream));
-  RUNTIME_CHECK(cudaMallocAsync(&buf2.id, sizeof(T) * n, buf2.stream));
-  RUNTIME_CHECK(cudaMallocAsync(&buf2.sd, sizeof(T), buf2.stream));
-
-  trace_copy(h_input.data(), block_size, cols + 1, buf1.buf, buf1.id, buf1.stream);
-  trace_execute(buf1.id, buf1.sd, buf1.sh, block_size, warp_size, buf1.stream);
-  offset += (cols + 1) * block_size;
-  rest -= block_size;
-
-  for (uint32_t idx = 1; idx < block_count; ++idx) {
-    const size_t s = std::min<size_t>(rest, block_size);
-    trace_copy(h_input.data() + offset, s, cols + 1, buf2.buf, buf2.id, buf2.stream);
-    trace_execute(buf2.id, buf2.sd, buf2.sh, s, warp_size, buf2.stream);
-    offset += (cols + 1) * block_size;
-    rest -= block_size;
-    cudaStreamSynchronize(buf1.stream);
-    result += *buf1.sh;
-    std::swap(buf1, buf2);
-  }
-  cudaStreamSynchronize(buf1.stream);
-  result += *buf1.sh;
-    
-  RUNTIME_CHECK(cudaFreeAsync(buf1.id, buf1.stream));
-  RUNTIME_CHECK(cudaFreeAsync(buf1.sd, buf1.stream));
-  RUNTIME_CHECK(cudaFreeAsync(buf2.id, buf2.stream));
-  RUNTIME_CHECK(cudaFreeAsync(buf2.sd, buf2.stream));
-
-  RUNTIME_CHECK(cudaStreamDestroy(stream1));
-  RUNTIME_CHECK(cudaStreamDestroy(stream2));
-  return result;
+  T *id;
+  T *sd;
+  T sh;
+  RUNTIME_CHECK(cudaMalloc(&id, sizeof(T) * n));
+  RUNTIME_CHECK(cudaMalloc(&sd, sizeof(T)));
+  std::vector<T> buf(n);
+  trace_copy(h_input.data(), n, cols + 1, buf.data(), id);
+  trace_execute(id, sd, &sh, n, warp_size);
+  RUNTIME_CHECK(cudaFree(id));
+  RUNTIME_CHECK(cudaFree(sd));
+  return sh;
 }
 
 /**
