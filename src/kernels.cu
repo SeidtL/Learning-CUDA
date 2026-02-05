@@ -1,7 +1,357 @@
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <type_traits>
 #include <vector>
 #include <cuda_fp16.h>
+#include <driver_types.h>
+#include <cuda_runtime.h>
 
 #include "../tester/utils.h"
+
+#define S_ASSERT(expr) assert(expr)
+// #define S_ASSERT(expr)
+
+template <uint32_t warp_size>
+constexpr auto full_mask_v = 0; 
+
+template <>
+constexpr uint32_t full_mask_v<32u> = 0xFFFFFFFFU;
+
+template <>
+constexpr uint64_t full_mask_v<64u> = 0xFFFFFFFFFFFFFFFFULL;
+
+int get_warp_size() {
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, 0);
+  return prop.warpSize;
+}
+
+template <uint32_t warp_size, typename T>
+__device__ __forceinline__
+static T warp_trace_reduce(T sum) {
+  #pragma unroll
+  for (auto offset = warp_size / 2; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(full_mask_v<warp_size>, sum, offset);
+  }
+  return sum;
+}
+
+template <typename T, uint32_t warp_size>
+__global__
+void trace_kernel(
+  const T * __restrict__ ptr,
+  T * __restrict__ gather,
+  int n
+) {
+  extern __shared__ char _smem[];
+  T *smem = reinterpret_cast<T*>(_smem);
+  auto idx = blockDim.x * blockIdx.x + threadIdx.x;
+  auto stride = blockDim.x * gridDim.x;
+
+  auto tid = threadIdx.x;
+
+  T sum{};
+  for (auto i = idx; i < n; i += stride) {
+    sum += ptr[i];
+  }
+  const T warp_sum = warp_trace_reduce<warp_size>(sum);
+
+  if (tid % warp_size == 0) {
+    smem[tid / warp_size] = warp_sum;
+  }
+  __syncthreads();
+
+  const auto num_warps = (blockDim.x + warp_size - 1) / warp_size;
+  if (tid < warp_size) {
+    T block_sum = (tid < num_warps) ? smem[tid] : T{0};
+    block_sum = warp_trace_reduce<warp_size>(block_sum);
+    if (tid == 0) {
+      atomicAdd(gather, block_sum);
+    }
+  }
+}
+
+template <typename T>
+using remove_cvref_t = std::remove_cv_t<std::remove_reference_t<T>>;
+
+template <typename To, typename From>
+__host__ __device__ __forceinline__
+static To cast(From x) {
+  using type = remove_cvref_t<From>;
+  if constexpr (std::is_same_v<type, half>) {
+    return static_cast<To>(__half2float(x));
+  } else {
+    return static_cast<To>(x);
+  }
+}
+
+template <typename T>
+class mdspan2d {
+private:
+  T* data_;
+  int row_stride_;
+  int col_stride_;
+
+public:
+  __device__
+  mdspan2d(T* data, int row_stride, int col_stride)
+      : data_(data), row_stride_(row_stride), col_stride_(col_stride) {}
+
+  __device__ __forceinline__
+  T& operator()(int r, int c) {
+      return data_[r * row_stride_ + c * col_stride_];
+  }
+
+  __device__ __forceinline__
+  const T& operator()(int r, int c) const {
+    return data_[r * row_stride_ + c * col_stride_];
+  }
+};
+
+template <typename T>
+__device__
+T* arena_alloc(uintptr_t &addr, size_t n) {
+    size_t alignment = alignof(T);
+    addr = (addr + alignment - 1) & ~(alignment - 1);
+    T* ptr = reinterpret_cast<T*>(addr);
+    addr += n * sizeof(T);
+    return ptr;
+}
+
+template <typename T>
+__device__ __forceinline__
+T exp_dispatch(T x) {
+  using type = remove_cvref_t<T>;
+  if constexpr (std::is_same_v<type, float>) {
+    return __expf(x);
+  } else {
+    static_assert(std::is_same_v<type, double>, "unsupport");
+    return exp(x);
+  }
+}
+
+__device__ __forceinline__
+void load_half2(half * __restrict__ dst, const half * __restrict__ src) {
+  *reinterpret_cast<half2*>(dst) = *reinterpret_cast<const half2*>(src);
+}
+
+template <typename T, typename U, size_t max_head_dim=64, uint32_t warp_size=32, uint32_t Tr=1>
+__global__
+void attention_kernel(
+  const T * __restrict__ q_base_ptr,
+  const T * __restrict__ k_base_ptr,
+  const T * __restrict__ v_base_ptr,
+  T * __restrict__ o_base_ptr,
+  float softmax_scale,
+  int batch_size,
+  int target_seq_len,
+  int src_seq_len,
+  int query_heads,
+  int kv_heads,
+  int head_dim,
+  bool is_causal,
+  int group_size,
+  uint32_t Br,
+  uint32_t Tc
+) {
+  extern __shared__ char _smem[];
+
+  #define k_valid_fn(qid, kid) ((kid) < src_seq_len && !(is_causal && (kid) > (qid)))
+
+  constexpr uint32_t Bc = warp_size;
+  uintptr_t smem = reinterpret_cast<uintptr_t>(_smem);
+  mdspan2d<float> Qs(arena_alloc<float>(smem, Br * head_dim), head_dim, 1);
+  mdspan2d<float> Ks(arena_alloc<float>(smem, Bc * head_dim), head_dim, 1);
+  // mdspan2d<T> Vs(arena_alloc<T>(smem, Bc * head_dim), 1, Bc);
+  mdspan2d<float> Vs(arena_alloc<float>(smem, Bc * head_dim), head_dim, 1);
+  mdspan2d<double> Ss(arena_alloc<double>(smem, Br * Bc), Bc, 1);
+
+  constexpr uint32_t Os_size = (max_head_dim + warp_size - 1) / warp_size;
+  float Os[(max_head_dim + warp_size - 1) / warp_size];
+
+  const auto bid = blockIdx.x;
+  const auto hid = blockIdx.y;
+  const auto outer_qid = blockIdx.z;
+
+  // q
+  const auto tid = threadIdx.x / warp_size;
+  // k
+  const auto wid = threadIdx.x % warp_size;
+
+  const mdspan2d<const T> Q(
+    q_base_ptr + bid * target_seq_len * query_heads * head_dim + hid * head_dim,
+    query_heads * head_dim, 1
+  );
+  const mdspan2d<const T> K(
+    k_base_ptr + bid * src_seq_len * kv_heads * head_dim + hid / group_size * head_dim,
+    kv_heads * head_dim, 1
+  );
+  const mdspan2d<const T> V(
+    v_base_ptr + bid * src_seq_len * kv_heads * head_dim + hid / group_size * head_dim,
+    kv_heads * head_dim, 1
+  );
+  mdspan2d<T> O(
+    o_base_ptr + bid * target_seq_len * query_heads * head_dim + hid * head_dim,
+    query_heads * head_dim, 1
+  );
+
+  for (uint32_t inner_qid = 0; inner_qid < Tr; ++inner_qid) {
+    const uint32_t i = outer_qid * Tr + inner_qid;
+    const uint32_t qid = i * Br + tid;
+    const bool q_valid = qid < target_seq_len;
+    // Load Q
+    if (qid < target_seq_len) {
+      for (uint32_t x = wid; x < head_dim; x += warp_size) {
+        Qs(tid, x) = cast<float>(Q(qid, x));
+      }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (uint32_t i = 0; i < Os_size; ++i) {
+      Os[i] = 0.0;
+    }
+
+    // float -> double doesn't work in Iluvatar
+    float l_old = 0.0;
+    // half, float doesn't work in Iluvatar
+    double m_old = -INFINITY;
+
+    for (int j = 0; j < Tc; ++j) {
+      // Load KV
+      for (uint32_t y = tid; y < Bc; y += Br) {
+        const auto kid = j * Bc + y;
+        if (kid < src_seq_len) {
+          for (uint32_t x = wid; x < head_dim; x += warp_size) {
+            Ks(y, x) = cast<float>(K(kid, x));
+            Vs(y, x) = cast<float>(V(kid, x));
+          }
+        }
+      }
+      __syncthreads();
+
+      // Q @ K^T
+      double m_new = -INFINITY;
+      const auto kid = j * Bc + wid;
+
+      const bool k_block_valid = not is_causal || j * Bc <= qid;
+      if (q_valid && k_block_valid) {
+        const bool k_valid = k_valid_fn(qid, kid);
+        if (k_valid) {
+          float t = 0.0f;
+          for (uint32_t y = 0; y < head_dim; y++) {
+            t += Qs(tid, y) * Ks(wid, y);
+          }
+          S_ASSERT(not isinf(t));
+          Ss(tid, wid) = cast<double>(t) * softmax_scale;
+          m_new = max(m_new, Ss(tid, wid));
+        } else {
+          Ss(tid, wid) = -INFINITY;
+        }
+        __syncwarp();
+
+        // max reduce
+        #pragma unroll
+        for (uint32_t offset = warp_size >> 1; offset > 0; offset >>= 1) {
+          m_new = max(m_new, __shfl_xor_sync(full_mask_v<warp_size>, m_new, offset));
+        }
+        m_new = max(m_old, m_new);
+
+        // update l, m
+        double l_new = 0.0;
+        Ss(tid, wid) = exp_dispatch<U>(Ss(tid, wid) - m_new);
+        l_new += Ss(tid, wid);
+        __syncwarp();
+
+        // sum reduce
+        #pragma unroll
+        for (uint32_t offset = warp_size >> 1; offset > 0; offset >>= 1) {
+          l_new += __shfl_xor_sync(full_mask_v<warp_size>, l_new, offset);
+        }
+        U exp_old = isinf(m_old) ? 0.0 : exp_dispatch<double>(m_old - m_new);
+        l_new = exp_old * l_old + l_new;
+
+        // P @ V
+        for (uint32_t x = wid; x < head_dim; x += warp_size) {
+          double t = 0.0f;
+
+          for (uint32_t _y = 0, y = wid; _y < Bc; _y++, y = (y + 1) % Bc) {
+            if (k_valid_fn(qid, j * Bc + y)) {
+              t += Ss(tid, y) * cast<double>(Vs(y, x));
+            }
+          }
+
+          Os[x / warp_size] = Os[x / warp_size] * exp_old + t;
+        }
+        m_old = m_new;
+        l_old = l_new;
+      }
+
+      __syncthreads();
+    }
+    if (q_valid) {
+      for (uint32_t x = wid; x < head_dim; x += warp_size) {
+        O(qid, x) = Os[x / warp_size] / l_old;
+      }
+    }
+  }
+}
+
+template <typename T, typename U, uint32_t Tr, typename ...Args>
+void attention_dispatch(uint32_t warp_size, size_t head_dim, dim3 grid, dim3 block, size_t smem_size, Args&&... args) {
+  if (warp_size == 32) {
+    constexpr uint32_t _warp_size = 32;
+    if (head_dim <= 32) {
+      attention_kernel<T, U, 32, _warp_size, Tr><<<grid, block, smem_size>>>(std::forward<Args>(args)...);
+    } else if (head_dim <= 64) {
+      attention_kernel<T, U, 64, _warp_size, Tr><<<grid, block, smem_size>>>(std::forward<Args>(args)...);
+    } else if (head_dim <= 128) {
+      attention_kernel<T, U, 128, _warp_size, Tr><<<grid, block, smem_size>>>(std::forward<Args>(args)...);
+    } else {
+      S_ASSERT(false);
+    }
+  } else {
+    constexpr uint32_t _warp_size = 64;
+    if (head_dim <= 32) {
+      attention_kernel<T, U, 32, _warp_size, Tr><<<grid, block, smem_size>>>(std::forward<Args>(args)...);
+    } else if (head_dim <= 64) {
+      attention_kernel<T, U, 64, _warp_size, Tr><<<grid, block, smem_size>>>(std::forward<Args>(args)...);
+    } else if (head_dim <= 128) {
+      attention_kernel<T, U, 128, _warp_size, Tr><<<grid, block, smem_size>>>(std::forward<Args>(args)...);
+    } else {
+      S_ASSERT(false);
+    }
+  }
+  RUNTIME_CHECK(cudaGetLastError());
+  RUNTIME_CHECK(cudaDeviceSynchronize());
+}
+
+
+template <typename T>
+void trace_copy(const T *h, size_t n, size_t stride, T *buffer, T *dst, cudaStream_t stream) {
+  for (size_t i = 0; i < n; ++i) {
+    buffer[i] = h[i * stride];
+  }
+  cudaMemcpyAsync(dst, buffer, sizeof(T) * n, cudaMemcpyHostToDevice, stream);
+}
+
+template <typename T>
+void trace_execute(const T *data, T *s_d, T *s_h, uint32_t n, uint32_t warp_size, cudaStream_t stream) {
+  constexpr static dim3 block {256};
+  constexpr static dim3 grid {1};
+  size_t smem_size = ((block.x + warp_size - 1) / warp_size) * sizeof(T);
+
+  cudaMemsetAsync(s_d, 0, sizeof(T), stream);
+  if (warp_size == 32) {
+    trace_kernel<T, 32><<<grid, block, smem_size, stream>>>(data, s_d, n);
+  } else if (warp_size == 64) {
+    trace_kernel<T, 64><<<grid, block, smem_size, stream>>>(data, s_d, n);
+  } else {
+    S_ASSERT(false);
+  }
+  cudaMemcpyAsync(s_h, s_d, sizeof(T), cudaMemcpyDeviceToHost, stream);
+}
 
 /**
  * @brief Computes the trace of a matrix.
@@ -20,12 +370,88 @@
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // TODO: Implement the trace function
-  return T(-1);
+
+  const size_t n = std::min(rows, cols);
+
+  if (n == 0) {
+    return T{0};
+  }
+  cudaStream_t stream1;
+  RUNTIME_CHECK(cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking));
+
+  T *sum;
+  T result {0};
+
+  constexpr uint32_t block_size = 1024;
+  const uint32_t block_count = (n + block_size - 1) / block_size; 
+  const uint32_t warp_size = get_warp_size();
+
+  rows = std::min(n, rows);
+  if (n <= block_size) {
+    T *id;
+    T *sd;
+    T sh;
+    RUNTIME_CHECK(cudaMallocAsync(&id, sizeof(T) * n, stream1));
+    RUNTIME_CHECK(cudaMallocAsync(&sd, sizeof(T), stream1));
+    std::vector<T> buf(n);
+    trace_copy(h_input.data(), n, cols + 1, buf.data(), id, stream1);
+    trace_execute(id, sd, &sh, n, warp_size, stream1);
+    cudaStreamSynchronize(stream1);
+    RUNTIME_CHECK(cudaFreeAsync(id, stream1));
+    RUNTIME_CHECK(cudaFreeAsync(sd, stream1));
+    RUNTIME_CHECK(cudaStreamDestroy(stream1));
+    return sh;
+  }
+
+  cudaStream_t stream2;
+  RUNTIME_CHECK(cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking));
+  
+  size_t offset = 0;
+  size_t rest = n;
+  // container
+  T _sh1, _sh2;
+  std::vector<T> _buf1(block_size), _buf2(block_size);
+
+  struct DoubleBuffer { cudaStream_t stream; T *sh; T *buf; T *id; T *sd; };
+  DoubleBuffer buf1 = {stream1, &_sh1, _buf1.data()};
+  DoubleBuffer buf2 = {stream2, &_sh2, _buf2.data()};
+
+  RUNTIME_CHECK(cudaMallocAsync(&buf1.id, sizeof(T) * n, buf1.stream));
+  RUNTIME_CHECK(cudaMallocAsync(&buf1.sd, sizeof(T), buf1.stream));
+  RUNTIME_CHECK(cudaMallocAsync(&buf2.id, sizeof(T) * n, buf2.stream));
+  RUNTIME_CHECK(cudaMallocAsync(&buf2.sd, sizeof(T), buf2.stream));
+
+  trace_copy(h_input.data(), block_size, cols + 1, buf1.buf, buf1.id, buf1.stream);
+  trace_execute(buf1.id, buf1.sd, buf1.sh, block_size, warp_size, buf1.stream);
+  offset += (cols + 1) * block_size;
+  rest -= block_size;
+
+  for (uint32_t idx = 1; idx < block_count; ++idx) {
+    const size_t s = std::min<size_t>(rest, block_size);
+    trace_copy(h_input.data() + offset, s, cols + 1, buf2.buf, buf2.id, buf2.stream);
+    trace_execute(buf2.id, buf2.sd, buf2.sh, s, warp_size, buf2.stream);
+    offset += (cols + 1) * block_size;
+    rest -= block_size;
+    cudaStreamSynchronize(buf1.stream);
+    result += *buf1.sh;
+    std::swap(buf1, buf2);
+  }
+  cudaStreamSynchronize(buf1.stream);
+  result += *buf1.sh;
+    
+  RUNTIME_CHECK(cudaFreeAsync(buf1.id, buf1.stream));
+  RUNTIME_CHECK(cudaFreeAsync(buf1.sd, buf1.stream));
+  RUNTIME_CHECK(cudaFreeAsync(buf2.id, buf2.stream));
+  RUNTIME_CHECK(cudaFreeAsync(buf2.sd, buf2.stream));
+
+  RUNTIME_CHECK(cudaStreamDestroy(stream1));
+  RUNTIME_CHECK(cudaStreamDestroy(stream2));
+  return result;
 }
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
- * 
+ *
  * @tparam T Data type (float) for input/output tensors
  * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
@@ -33,7 +459,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] batch_size Batch dimension size
  * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
+ * @param[in] src_seq_len Source sequence length
  * @param[in] query_heads Number of query attention heads
  * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
  * @param[in] head_dim Dimension size of each attention head
@@ -42,9 +468,78 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+  using U = std::conditional_t<std::is_same_v<remove_cvref_t<T>, float>, double, float>;
+  constexpr size_t type_size = sizeof(T);
+
+  const size_t q_bytes = type_size * h_q.size();
+  const size_t k_bytes = type_size * h_k.size();
+  const size_t v_bytes = type_size * h_v.size();
+  const size_t o_bytes = type_size * h_o.size();
+
+  T *d_q, *d_k, *d_v, *d_o;
+  RUNTIME_CHECK(cudaMalloc(&d_q, q_bytes));
+  RUNTIME_CHECK(cudaMalloc(&d_k, k_bytes));
+  RUNTIME_CHECK(cudaMalloc(&d_v, v_bytes));
+  RUNTIME_CHECK(cudaMalloc(&d_o, o_bytes));
+
+  RUNTIME_CHECK(cudaMemcpy(d_q, h_q.data(), q_bytes, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_k, h_k.data(), k_bytes, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), v_bytes, cudaMemcpyHostToDevice));
+
+  const auto warpSize = get_warp_size();
+
+  uint32_t Bc = warpSize;
+  constexpr uint32_t Br = 16;
+  constexpr uint32_t Tr = 1;
+  uint32_t Tc = (src_seq_len + Bc - 1) / Bc;
+  uint32_t q_tile_count = (target_seq_len + Br - 1) / Br;
+  uint32_t q_grid = (q_tile_count + Tr - 1) / Tr;
+
+  uint32_t group_size = query_heads / kv_heads;
+
+  size_t smem_bytes = (Bc * head_dim * 2 + Br * head_dim) * sizeof(float)
+    + (Br * Bc) * sizeof(double) + alignof(double);
+
+  dim3 block{Bc * Br};
+  dim3 grid{
+    static_cast<uint32_t>(batch_size),
+    static_cast<uint32_t>(query_heads),
+    q_grid
+  };
+
+  const double softmax_scale = 1.0 / sqrt(static_cast<double>(head_dim));
+
+  attention_dispatch<T, U, Tr>(
+    warpSize,
+    head_dim,
+    grid,
+    block,
+    smem_bytes,
+    d_q,
+    d_k,
+    d_v,
+    d_o,
+    softmax_scale,
+    batch_size,
+    target_seq_len,
+    src_seq_len,
+    query_heads,
+    kv_heads,
+    head_dim,
+    is_causal,
+    group_size,
+    Br,
+    Tc
+  );
+
+  RUNTIME_CHECK(cudaMemcpy(h_o.data(), d_o, o_bytes, cudaMemcpyDeviceToHost));
+
+  RUNTIME_CHECK(cudaFree(d_q));
+  RUNTIME_CHECK(cudaFree(d_k));
+  RUNTIME_CHECK(cudaFree(d_v));
+  RUNTIME_CHECK(cudaFree(d_o));
 }
 
 // *********************************************************************
